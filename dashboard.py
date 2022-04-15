@@ -1,7 +1,7 @@
 # import libraries
 from __future__ import division
-from datetime import datetime, timedelta
-
+from datetime import datetime, timedelta, date
+import datetime as dt
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
@@ -9,7 +9,6 @@ from sklearn.metrics import classification_report,confusion_matrix
 import numpy as np
 import seaborn as sns
 from sklearn.cluster import KMeans
-
 
 import chart_studio.plotly as py
 import plotly.offline as pyoff
@@ -352,6 +351,249 @@ plot_layout = go.Layout(
         yaxis= {'title': "Frequency"},
         xaxis= {'title': "Recency"},
         title='Segments'
+    )
+fig = go.Figure(data=plot_data, layout=plot_layout)
+st.plotly_chart(fig, use_container_width=True)
+# pyoff.iplot(fig)
+
+st.header('Customer LifeTime Value')
+#Customer lifetime value
+
+#read data from csv and redo the data work we done before
+tx_data = pd.read_csv('data/online_retail_II.csv')
+tx_data['InvoiceDate'] = pd.to_datetime(tx_data['InvoiceDate'])
+tx_uk = tx_data.query("Country=='United Kingdom'").reset_index(drop=True)
+
+#create 3m and 6m dataframes
+tx_3m = tx_uk[(tx_uk.InvoiceDate < dt.datetime(2011,6,1)) & (tx_uk.InvoiceDate >= dt.datetime(2011,3,1))].reset_index(drop=True)
+tx_6m = tx_uk[(tx_uk.InvoiceDate >= dt.datetime(2011,6,1)) & (tx_uk.InvoiceDate < dt.datetime(2011,12,1))].reset_index(drop=True)
+
+#create tx_user for assigning clustering
+tx_user = pd.DataFrame(tx_3m['Customer ID'].unique())
+tx_user.columns = ['Customer ID']
+
+#order cluster method
+def order_cluster(cluster_field_name, target_field_name,df,ascending):
+    new_cluster_field_name = 'new_' + cluster_field_name
+    df_new = df.groupby(cluster_field_name)[target_field_name].mean().reset_index()
+    df_new = df_new.sort_values(by=target_field_name,ascending=ascending).reset_index(drop=True)
+    df_new['index'] = df_new.index
+    df_final = pd.merge(df,df_new[[cluster_field_name,'index']], on=cluster_field_name)
+    df_final = df_final.drop([cluster_field_name],axis=1)
+    df_final = df_final.rename(columns={"index":cluster_field_name})
+    return df_final
+
+
+#calculate recency score
+tx_max_purchase = tx_3m.groupby('Customer ID').InvoiceDate.max().reset_index()
+tx_max_purchase.columns = ['Customer ID','MaxPurchaseDate']
+tx_max_purchase['Recency'] = (tx_max_purchase['MaxPurchaseDate'].max() - tx_max_purchase['MaxPurchaseDate']).dt.days
+tx_user = pd.merge(tx_user, tx_max_purchase[['Customer ID','Recency']], on='Customer ID')
+
+kmeans = KMeans(n_clusters=4)
+kmeans.fit(tx_user[['Recency']])
+tx_user['RecencyCluster'] = kmeans.predict(tx_user[['Recency']])
+
+tx_user = order_cluster('RecencyCluster', 'Recency',tx_user,False)
+
+#calcuate frequency score
+tx_frequency = tx_3m.groupby('Customer ID').InvoiceDate.count().reset_index()
+tx_frequency.columns = ['Customer ID','Frequency']
+tx_user = pd.merge(tx_user, tx_frequency, on='Customer ID')
+
+kmeans = KMeans(n_clusters=4)
+kmeans.fit(tx_user[['Frequency']])
+tx_user['FrequencyCluster'] = kmeans.predict(tx_user[['Frequency']])
+
+tx_user = order_cluster('FrequencyCluster', 'Frequency',tx_user,True)
+
+#calcuate revenue score
+tx_3m['Revenue'] = tx_3m['Price'] * tx_3m['Quantity']
+tx_revenue = tx_3m.groupby('Customer ID').Revenue.sum().reset_index()
+tx_user = pd.merge(tx_user, tx_revenue, on='Customer ID')
+
+kmeans = KMeans(n_clusters=4)
+kmeans.fit(tx_user[['Revenue']])
+tx_user['RevenueCluster'] = kmeans.predict(tx_user[['Revenue']])
+tx_user = order_cluster('RevenueCluster', 'Revenue',tx_user,True)
+
+
+#overall scoring
+tx_user['OverallScore'] = tx_user['RecencyCluster'] + tx_user['FrequencyCluster'] + tx_user['RevenueCluster']
+tx_user['Segment'] = 'Low-Value'
+tx_user.loc[tx_user['OverallScore']>2,'Segment'] = 'Mid-Value' 
+tx_user.loc[tx_user['OverallScore']>4,'Segment'] = 'High-Value' 
+
+#calculate revenue and create a new dataframe for it
+tx_6m['Revenue'] = tx_6m['Price'] * tx_6m['Quantity']
+tx_user_6m = tx_6m.groupby('Customer ID')['Revenue'].sum().reset_index()
+tx_user_6m.columns = ['Customer ID','m6_Revenue']
+
+tx_merge = pd.merge(tx_user, tx_user_6m, on='Customer ID', how='left')
+tx_merge = tx_merge.fillna(0)
+
+tx_graph = tx_merge.query("m6_Revenue < 30000")
+
+plot_data = [
+    go.Scatter(
+        x=tx_graph.query("Segment == 'Low-Value'")['OverallScore'],
+        y=tx_graph.query("Segment == 'Low-Value'")['m6_Revenue'],
+        mode='markers',
+        name='Low',
+        marker= dict(size= 7,
+            line= dict(width=1),
+            color= 'blue',
+            opacity= 0.8
+           )
+    ),
+        go.Scatter(
+        x=tx_graph.query("Segment == 'Mid-Value'")['OverallScore'],
+        y=tx_graph.query("Segment == 'Mid-Value'")['m6_Revenue'],
+        mode='markers',
+        name='Mid',
+        marker= dict(size= 9,
+            line= dict(width=1),
+            color= 'green',
+            opacity= 0.5
+           )
+    ),
+        go.Scatter(
+        x=tx_graph.query("Segment == 'High-Value'")['OverallScore'],
+        y=tx_graph.query("Segment == 'High-Value'")['m6_Revenue'],
+        mode='markers',
+        name='High',
+        marker= dict(size= 11,
+            line= dict(width=1),
+            color= 'red',
+            opacity= 0.9
+           )
+    ),
+]
+
+plot_layout = go.Layout(
+        yaxis= {'title': "6m LTV"},
+        xaxis= {'title': "RFM Score"},
+        title='LTV'
+    )
+fig = go.Figure(data=plot_data, layout=plot_layout)
+st.plotly_chart(fig, use_container_width=True)
+# pyoff.iplot(fig)
+
+st.header('Churn Prediction')
+#churn prediction
+df_data = pd.read_csv('data/churn.csv')
+
+df_data.loc[df_data.Churn=='No','Churn'] = 0 
+df_data.loc[df_data.Churn=='Yes','Churn'] = 1
+
+df_plot = df_data.groupby('gender').Churn.apply(np.mean).reset_index()
+plot_data = [
+    go.Bar(
+        x=df_plot['gender'],
+        y=df_plot['Churn'],
+        width = [0.5, 0.5],
+        marker=dict(
+        color=['green', 'blue'])
+    )
+]
+
+plot_layout = go.Layout(
+        xaxis={"type": "category"},
+        yaxis={"title": "Churn Rate"},
+        title='Gender',
+        plot_bgcolor  = 'rgb(243,243,243)',
+        paper_bgcolor  = 'rgb(243,243,243)',
+    )
+fig = go.Figure(data=plot_data, layout=plot_layout)
+st.plotly_chart(fig, use_container_width=True)
+# pyoff.iplot(fig)
+
+df_plot = df_data.groupby('PaymentMethod').Churn.apply(np.mean).reset_index()
+plot_data = [
+    go.Bar(
+        x=df_plot['PaymentMethod'],
+        y=df_plot['Churn'],
+        width = [0.5, 0.5, 0.5,0.5],
+        marker=dict(
+        color=['green', 'blue', 'orange','red'])
+    )
+]
+
+plot_layout = go.Layout(
+        xaxis={"type": "category"},
+        title='Payment Method',
+        plot_bgcolor  = "rgb(243,243,243)",
+        paper_bgcolor  = "rgb(243,243,243)",
+    )
+fig = go.Figure(data=plot_data, layout=plot_layout)
+st.plotly_chart(fig, use_container_width=True)
+# pyoff.iplot(fig)
+
+df_plot = df_data.groupby('tenure').Churn.apply(np.mean).reset_index()
+
+
+plot_data = [
+    go.Scatter(
+        x=df_plot['tenure'],
+        y=df_plot['Churn'],
+        mode='markers',
+        name='Low',
+        marker= dict(size= 7,
+            line= dict(width=1),
+            color= 'blue',
+            opacity= 0.8
+           ),
+    )
+]
+
+plot_layout = go.Layout(
+        yaxis= {'title': "Churn Rate"},
+        xaxis= {'title': "Tenure"},
+        title='Tenure based Churn rate',
+        plot_bgcolor  = "rgb(243,243,243)",
+        paper_bgcolor  = "rgb(243,243,243)",
+    )
+fig = go.Figure(data=plot_data, layout=plot_layout)
+st.plotly_chart(fig, use_container_width=True)
+# pyoff.iplot(fig)
+
+def order_cluster(cluster_field_name, target_field_name,df,ascending):
+    new_cluster_field_name = 'new_' + cluster_field_name
+    df_new = df.groupby(cluster_field_name)[target_field_name].mean().reset_index()
+    df_new = df_new.sort_values(by=target_field_name,ascending=ascending).reset_index(drop=True)
+    df_new['index'] = df_new.index
+    df_final = pd.merge(df,df_new[[cluster_field_name,'index']], on=cluster_field_name)
+    df_final = df_final.drop([cluster_field_name],axis=1)
+    df_final = df_final.rename(columns={"index":cluster_field_name})
+    return df_final
+sse={}
+df_cluster = df_data[['tenure']]
+for k in range(1, 10):
+    kmeans = KMeans(n_clusters=k, max_iter=1000).fit(df_cluster)
+    df_cluster["clusters"] = kmeans.labels_
+    sse[k] = kmeans.inertia_ 
+kmeans = KMeans(n_clusters=3)
+kmeans.fit(df_data[['tenure']])
+df_data['TenureCluster'] = kmeans.predict(df_data[['tenure']])
+df_data = order_cluster('TenureCluster', 'tenure',df_data,True)
+df_data['TenureCluster'] = df_data["TenureCluster"].replace({0:'Low',1:'Mid',2:'High'})
+
+df_plot = df_data.groupby('TenureCluster').Churn.apply(np.mean).reset_index()
+plot_data = [
+    go.Bar(
+        x=df_plot['TenureCluster'],
+        y=df_plot['Churn'],
+        width = [0.5, 0.5, 0.5,0.5],
+        marker=dict(
+        color=['green', 'blue', 'orange','red'])
+    )
+]
+
+plot_layout = go.Layout(
+        xaxis={"type": "category","categoryarray":['Low','Mid','High']},
+        title='Tenure Cluster vs Churn Rate',
+        plot_bgcolor  = "rgb(243,243,243)",
+        paper_bgcolor  = "rgb(243,243,243)",
     )
 fig = go.Figure(data=plot_data, layout=plot_layout)
 st.plotly_chart(fig, use_container_width=True)
